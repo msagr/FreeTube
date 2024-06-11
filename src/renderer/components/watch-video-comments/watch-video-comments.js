@@ -37,6 +37,16 @@ export default defineComponent({
       default: null,
     },
   },
+  emits: ['timestamp-event'],
+  setup: function () {
+    // As we don't need or even want reactivity here,
+    // we can use a Map.
+    const replyTokens = new Map()
+
+    return {
+      replyTokens
+    }
+  },
   data: function () {
     return {
       isLoading: false,
@@ -63,10 +73,6 @@ export default defineComponent({
       return this.$store.getters.getHideCommentPhotos
     },
 
-    commentAutoLoadEnabled: function () {
-      return this.$store.getters.getCommentAutoLoadEnabled
-    },
-
     sortNames: function () {
       return [
         this.$t('Comments.Top comments'),
@@ -85,8 +91,13 @@ export default defineComponent({
       return (this.sortNewest) ? 'newest' : 'top'
     },
 
+    generalAutoLoadMorePaginatedItemsEnabled() {
+      return this.$store.getters.getGeneralAutoLoadMorePaginatedItemsEnabled
+    },
     observeVisibilityOptions: function () {
-      if (!this.commentAutoLoadEnabled) { return false }
+      if (!this.generalAutoLoadMorePaginatedItemsEnabled) {
+        return false
+      }
       if (!this.videoPlayerReady) { return false }
 
       return {
@@ -204,7 +215,18 @@ export default defineComponent({
         }
 
         const parsedComments = comments.contents
-          .map(commentThread => parseLocalComment(commentThread.comment, commentThread))
+          .map(commentThread => {
+            // Use destructuring to create a new object without the replyToken
+            const { replyToken, ...comment } = parseLocalComment(commentThread.comment, commentThread)
+
+            if (comment.hasReplyToken) {
+              this.replyTokens.set(comment.id, replyToken)
+            } else {
+              this.replyTokens.delete(comment.id)
+            }
+
+            return comment
+          })
 
         if (more) {
           this.commentData = this.commentData.concat(parsedComments)
@@ -236,7 +258,7 @@ export default defineComponent({
       try {
         const comment = this.commentData[index]
         /** @type {import('youtubei.js').YTNodes.CommentThread} */
-        const commentThread = comment.replyToken
+        const commentThread = this.replyTokens.get(comment.id)
 
         if (comment.replies.length > 0) {
           await commentThread.getContinuation()
@@ -246,7 +268,14 @@ export default defineComponent({
           comment.replies = commentThread.replies.map(reply => parseLocalComment(reply))
         }
 
-        comment.replyToken = commentThread.has_continuation ? commentThread : null
+        if (commentThread.has_continuation) {
+          this.replyTokens.set(comment.id, commentThread)
+          comment.hasReplyToken = true
+        } else {
+          this.replyTokens.delete(comment.id)
+          comment.hasReplyToken = false
+        }
+
         comment.showReplies = true
       } catch (err) {
         console.error(err)
@@ -269,6 +298,16 @@ export default defineComponent({
         nextPageToken: this.nextPageToken,
         sortNewest: this.sortNewest
       }).then(({ response, commentData }) => {
+        commentData = commentData.map(({ replyToken, ...comment }) => {
+          if (comment.hasReplyToken) {
+            this.replyTokens.set(comment.id, replyToken)
+          } else {
+            this.replyTokens.delete(comment.id)
+          }
+
+          return comment
+        })
+
         this.commentData = this.commentData.concat(commentData)
         this.nextPageToken = response.continuation
         this.isLoading = false
@@ -303,12 +342,23 @@ export default defineComponent({
 
     getCommentRepliesInvidious: function (index) {
       showToast(this.$t('Comments.Getting comment replies, please wait'))
-      const replyToken = this.commentData[index].replyToken
+
+      const comment = this.commentData[index]
+      const replyToken = this.replyTokens.get(comment.id)
+
       invidiousGetCommentReplies({ id: this.id, replyToken: replyToken })
         .then(({ commentData, continuation }) => {
-          this.commentData[index].replies = this.commentData[index].replies.concat(commentData)
-          this.commentData[index].showReplies = true
-          this.commentData[index].replyToken = continuation
+          comment.replies = comment.replies.concat(commentData)
+          comment.showReplies = true
+
+          if (continuation) {
+            this.replyTokens.set(comment.id, continuation)
+            comment.hasReplyToken = true
+          } else {
+            this.replyTokens.delete(comment.id)
+            comment.hasReplyToken = false
+          }
+
           this.isLoading = false
         }).catch((xhr) => {
           console.error(xhr)

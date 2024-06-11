@@ -117,6 +117,7 @@ export default defineComponent({
       default: false
     }
   },
+  emits: ['ended', 'error', 'ready', 'store-caption-list', 'timeupdate', 'toggle-theatre-mode'],
   data: function () {
     return {
       powerSaveBlocker: null,
@@ -729,8 +730,8 @@ export default defineComponent({
         // right click menu
         if (process.env.IS_ELECTRON) {
           const { ipcRenderer } = require('electron')
-          ipcRenderer.removeAllListeners('showVideoStatistics')
-          ipcRenderer.on('showVideoStatistics', (event) => {
+          ipcRenderer.removeAllListeners(IpcChannels.SHOW_VIDEO_STATISTICS)
+          ipcRenderer.on(IpcChannels.SHOW_VIDEO_STATISTICS, (event) => {
             this.toggleShowStatsModal()
           })
         }

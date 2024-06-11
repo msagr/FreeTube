@@ -1,6 +1,6 @@
 import { ClientType, Endpoints, Innertube, Misc, UniversalCache, Utils, YT } from 'youtubei.js'
 import Autolinker from 'autolinker'
-import { join } from 'path'
+import { SEARCH_CHAR_LIMIT } from '../../../constants'
 
 import { PlayerCache } from './PlayerCache'
 import {
@@ -8,7 +8,6 @@ import {
   calculatePublishedDate,
   escapeHTML,
   extractNumberFromString,
-  getUserDataPath,
   toLocalePublicationString
 } from '../utils'
 
@@ -40,14 +39,17 @@ async function createInnertube({ withPlayer = false, location = undefined, safet
   let cache
   if (withPlayer) {
     if (process.env.IS_ELECTRON) {
-      const userData = await getUserDataPath()
-      cache = new PlayerCache(join(userData, 'player_cache'))
+      cache = new PlayerCache()
     } else {
       cache = new UniversalCache(false)
     }
   }
 
   return await Innertube.create({
+    // This setting is enabled by default and results in YouTube.js reusing the same session across different Innertube instances.
+    // That behavior is highly undesirable for FreeTube, as we want to create a new session every time to limit tracking.
+    enable_session_cache: false,
+
     retrieve_player: !!withPlayer,
     location: location,
     enable_safety_mode: !!safetyMode,
@@ -63,6 +65,12 @@ async function createInnertube({ withPlayer = false, location = undefined, safet
 let searchSuggestionsSession = null
 
 export async function getLocalSearchSuggestions(query) {
+  if (query.length > SEARCH_CHAR_LIMIT) {
+    // There's an event handler on the search input so avoid displaying an exception
+    console.error(`Query is over ${SEARCH_CHAR_LIMIT} characters`)
+    return
+  }
+
   // reuse innertube instance to keep the search suggestions snappy
   if (searchSuggestionsSession === null) {
     searchSuggestionsSession = await createInnertube()
@@ -294,7 +302,7 @@ export async function getLocalChannelVideos(id) {
     }))
 
     const videosTab = new YT.Channel(null, response)
-    const { id: channelId = id, name, thumbnailUrl } = parseLocalChannelHeader(videosTab)
+    const { id: channelId = id, name, thumbnailUrl } = parseLocalChannelHeader(videosTab, true)
 
     let videos
 
@@ -336,7 +344,7 @@ export async function getLocalChannelLiveStreams(id) {
     }))
 
     let liveStreamsTab = new YT.Channel(innertube.actions, response)
-    const { id: channelId = id, name, thumbnailUrl } = parseLocalChannelHeader(liveStreamsTab)
+    const { id: channelId = id, name, thumbnailUrl } = parseLocalChannelHeader(liveStreamsTab, true)
 
     let videos
 
@@ -404,8 +412,9 @@ export async function getLocalChannelCommunity(id) {
 
 /**
  * @param {YT.Channel} channel
+ * @param {boolean} onlyIdNameThumbnail
  */
-export function parseLocalChannelHeader(channel) {
+export function parseLocalChannelHeader(channel, onlyIdNameThumbnail = false) {
   /** @type {string=} */
   let id
   /** @type {string} */
@@ -432,8 +441,11 @@ export function parseLocalChannelHeader(channel) {
       id = header.author.id
       name = header.author.name
       thumbnailUrl = header.author.best_thumbnail.url
-      bannerUrl = header.banner?.[0]?.url
-      subscriberText = header.subscribers?.text
+
+      if (!onlyIdNameThumbnail) {
+        bannerUrl = header.banner?.[0]?.url
+        subscriberText = header.subscribers?.text
+      }
       break
     }
     case 'CarouselHeader': {
@@ -451,13 +463,16 @@ export function parseLocalChannelHeader(channel) {
        */
       const topicChannelDetails = header.contents.find(node => node.type === 'TopicChannelDetails')
       name = topicChannelDetails.title.text
-      subscriberText = topicChannelDetails.subtitle.text
       thumbnailUrl = topicChannelDetails.avatar[0].url
 
       if (channel.metadata.external_id) {
         id = channel.metadata.external_id
       } else {
         id = topicChannelDetails.subscribe_button.channel_id
+      }
+
+      if (!onlyIdNameThumbnail) {
+        subscriberText = topicChannelDetails.subtitle.text
       }
       break
     }
@@ -471,12 +486,14 @@ export function parseLocalChannelHeader(channel) {
       const header = channel.header
       name = header.title.text
       thumbnailUrl = header.box_art.at(-1).url
-      bannerUrl = header.banner[0]?.url
-
-      const badges = header.badges.map(badge => badge.label).filter(tag => tag)
-      tags.push(...badges)
-
       id = channel.current_tab?.endpoint.payload.browseId
+
+      if (!onlyIdNameThumbnail) {
+        bannerUrl = header.banner[0]?.url
+
+        const badges = header.badges.map(badge => badge.label).filter(tag => tag)
+        tags.push(...badges)
+      }
       break
     }
     case 'PageHeader': {
@@ -508,7 +525,7 @@ export function parseLocalChannelHeader(channel) {
         thumbnailUrl = channel.metadata.thumbnail[0].url
       }
 
-      if (header.content.banner) {
+      if (!onlyIdNameThumbnail && header.content.banner) {
         bannerUrl = header.content.banner.image[0]?.url
       }
 
@@ -525,7 +542,7 @@ export function parseLocalChannelHeader(channel) {
         id = channel.metadata.external_id
       }
 
-      if (header.content.metadata) {
+      if (!onlyIdNameThumbnail && header.content.metadata) {
         // YouTube has already changed the indexes for where the information is stored once,
         // so we should search for it instead of using hardcoded indexes, just to be safe for the future
 
@@ -536,6 +553,14 @@ export function parseLocalChannelHeader(channel) {
       }
 
       break
+    }
+  }
+
+  if (onlyIdNameThumbnail) {
+    return {
+      id,
+      name,
+      thumbnailUrl
     }
   }
 
@@ -697,14 +722,16 @@ export function parseLocalPlaylistVideo(video) {
     // the accessiblity label contains the full view count
     // the video info only contains the short view count
     if (video_.accessibility_label) {
-      const match = video_.accessibility_label.match(/([\d,.]+|no) views?$/i)
+      // the `.*\s+` at the start of the regex, ensures we match the last occurence
+      // just in case the video title also contains that pattern
+      const match = video_.accessibility_label.match(/.*\s+([\d,.]+|no)\s+views?/)
 
       if (match) {
         const count = match[1]
 
         // as it's rare that a video has no views,
         // checking the length allows us to avoid running toLowerCase unless we have to
-        if (count.length === 2 && count.toLowerCase() === 'no') {
+        if (count.length === 2 && count === 'no') {
           viewCount = 0
         } else {
           const views = extractNumberFromString(count)
@@ -718,11 +745,19 @@ export function parseLocalPlaylistVideo(video) {
 
     let publishedText
     // normal videos have 3 text runs with the last one containing the published date
+    // OR no runs and just text with the published date (if the view count is missing)
     // live videos have 2 text runs with the number of people watching
     // upcoming either videos don't have any info text or the number of people waiting,
     // but we have the premiere date for those, so we don't need the published date
-    if (video_.video_info.runs && video_.video_info.runs.length === 3) {
-      publishedText = video_.video_info.runs[2].text
+
+    if (!video_.is_upcoming && !video_.is_live) {
+      const hasRuns = !!video_.video_info.runs
+
+      if (hasRuns && video_.video_info.runs.length === 3) {
+        publishedText = video_.video_info.runs[2].text
+      } else if (!hasRuns && video_.video_info.text) {
+        publishedText = video_.video_info.text
+      }
     }
 
     const published = calculatePublishedDate(
@@ -765,6 +800,8 @@ export function parseLocalListVideo(item) {
       lengthSeconds: isNaN(movie.duration.seconds) ? '' : movie.duration.seconds,
       liveNow: false,
       isUpcoming: false,
+      is4k: movie.is_4k,
+      hasCaptions: movie.has_captions
     }
   } else {
     /** @type {import('youtubei.js').YTNodes.Video} */
@@ -795,7 +832,9 @@ export function parseLocalListVideo(item) {
       lengthSeconds: isNaN(video.duration.seconds) ? '' : video.duration.seconds,
       liveNow: video.is_live,
       isUpcoming: video.is_upcoming || video.is_premiere,
-      premiereDate: video.upcoming
+      premiereDate: video.upcoming,
+      is4k: video.is_4k,
+      hasCaptions: video.has_captions
     }
   }
 }
@@ -909,6 +948,10 @@ function convertSearchFilters(filters) {
 
     if (filters.duration) {
       convertedFilters.duration = filters.duration
+    }
+
+    if (filters.features) {
+      convertedFilters.features = filters.features
     }
   }
 
@@ -1063,13 +1106,16 @@ export function mapLocalFormat(format) {
 export function parseLocalComment(comment, commentThread = undefined) {
   let hasOwnerReplied = false
   let replyToken = null
+  let hasReplyToken = false
 
   if (commentThread?.has_replies) {
     hasOwnerReplied = commentThread.comment_replies_data.has_channel_owner_replied
     replyToken = commentThread
+    hasReplyToken = true
   }
 
   const parsed = {
+    id: comment.comment_id,
     dataType: 'local',
     authorLink: comment.author.id,
     author: comment.author.name,
@@ -1081,6 +1127,7 @@ export function parseLocalComment(comment, commentThread = undefined) {
     text: Autolinker.link(parseLocalTextRuns(comment.content.runs, 16, { looseChannelNameDetection: true })),
     isHearted: !!comment.is_hearted,
     hasOwnerReplied,
+    hasReplyToken,
     replyToken,
     showReplies: false,
     replies: [],
